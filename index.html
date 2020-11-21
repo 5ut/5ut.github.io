@@ -1,0 +1,279 @@
+<html>
+
+	<head>
+		<style>
+			body{
+				background:black;
+				text-align: center;
+			}
+			
+			#download{
+				background:#464646;
+				margin:15px;
+			}
+		</style>
+		
+		<script src="https://cdn.jsdelivr.net/npm/web-streams-polyfill@2.0.2/dist/ponyfill.min.js"></script>
+		<script src="https://cdn.jsdelivr.net/npm/streamsaver@2.0.3/StreamSaver.min.js"></script>
+		<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+		<script>
+			const streamSaver = window.streamSaver
+		</script>
+		<script>
+			//Parses together a header file, downloading in a "linked list" style
+			async function getHeader(URL){
+				var data;
+				var dataMeta;
+				
+				//Loop through the trail of header files, and append all
+				dataMeta = await getURLData(URL);
+				data = dataMeta.data;
+				while(dataMeta.meta.length){
+					dataMeta = await getURLData(URL);
+					data = (Uint8Array.from([...new Uint8Array(data), ...new Uint8Array(dataMeta.data)])).buffer;
+				}
+				
+				//Decode JSON data created
+				var strDec = new TextDecoder();
+				data = strDec.decode(data);
+				data = JSON.parse(data);
+				
+				return data;
+			}
+			
+			//Returns files (or ranges of file)
+			function getFile(header, file, start=-1, end=-1){
+				return new Promise(async function(resolve, reject){
+					if(start > end){
+						reject("Invalid byte range");
+						return;
+					}
+					
+					if(!(file in header.fileInfo)){
+						reject("File does not exist: "+file);
+						return;
+					}
+					
+					var byteStart = header.fileInfo[file].startByte;
+					var byteEnd = header.fileInfo[file].endByte;
+					var fileStart = byteToFile(header, byteStart);
+					var fileEnd = byteToFile(header, byteEnd);
+					
+					//We collect all data around that file, if it span across 2 files, we combine both.
+					var data;
+					if(fileStart == fileEnd){
+						data = new Uint8Array((await getURLData(header.URLPrefix + header.fileUrls[fileStart])).data);
+					}else{
+						var tmp1 = new Uint8Array((await getURLData(header.URLPrefix + header.fileUrls[fileStart])).data);
+						var tmp2 = new Uint8Array((await getURLData(header.URLPrefix + header.fileUrls[fileEnd])).data);
+						
+						data = new Uint8Array(tmp1.length + tmp2.length);
+						data.set(tmp1);
+						data.set(tmp2, tmp1.length);
+					}
+					
+					//Now we trim extra data.
+					byteStart = byteStart - (fileStart==header.numFiles?(header.numFiles-1)*header.fileSize:fileStart*header.fileSize);
+					byteEnd = byteEnd - (fileEnd==header.numFiles?(header.numFiles-1)*header.fileSize:fileEnd*header.fileSize) + 1;
+					if(fileEnd > fileStart){
+						byteEnd += header.fileSize;//We're in the "second file" portition
+					}
+					
+					var tmpData = new Uint8Array(byteEnd - byteStart);
+					for(var i=0;i<byteEnd - byteStart;i++){
+						tmpData[i] = data[i+byteStart];
+					}
+					data = tmpData;
+					
+					
+					//We trim to only get the range
+					if(start != -1 && end != -1){
+						tmpData = new Uint8Array(end - start);
+						for(var i=0;i<tmpData.length;i++){
+							tmpData[i] = data[i+start];
+						}
+						data = tmpData;
+					}
+					
+					resolve(data.buffer);
+				});
+				
+			}
+			
+			//Given a byte position, returns the file that would host that byte.
+			function byteToFile(header, bytePos){
+				if(bytePos < 0 || bytePos > header.totalSize-1){
+					return -1;
+				}
+				
+				if(bytePos == 0){
+					return 0;
+				}
+			
+				var curPos = 0;
+				var curFile = 0;
+				while(curPos < bytePos){
+					curPos += header.fileSize-1;
+					curFile++;
+				}
+				
+				return curFile-1;
+			}
+			
+			//Loads in a URL file. Calls back once done.
+			var dataCache = {files:{}, totalSize:0, fileHistory:[]};
+			const dataCacheMax = 1024*1024*80;//80 MB memory limit
+			function getURLData(URL){
+				//Clear previous script
+				var script = document.querySelector("#fileLoader");
+				if(script){
+					script.remove();
+				}
+				
+				//Initalize and reset document variables
+				document.AP = "";
+				document.p = "";
+			
+				return new Promise(function(resolve, reject){
+					
+					//Check if downloaded already, if not redownload
+					if(!(URL in dataCache.files)){
+						var script = document.createElement('script');
+						script.onload = function(){
+							var data = 	{data:base64ToBuff(document.AP), meta:document.p};
+							document.AP = "";
+							document.p = "";
+							
+							//Check if cache is full
+							while(dataCacheMax < dataCache.totalSize + data.data.byteLength){
+								console.log("Clearing cache");
+								var lastFile = dataCache.fileHistory.shift();//Oldest file added
+								dataCache.totalSize -= dataCache.files[lastFile].size;
+								delete dataCache.files[lastFile];
+							}
+							
+							dataCache.files[URL] = {};
+							dataCache.files[URL].data = data;
+							dataCache.files[URL].size = data.data.byteLength;
+							dataCache.fileHistory.push(URL);
+							dataCache.totalSize += data.data.byteLength;
+							
+							script.remove();
+
+							resolve(data);
+						};
+						script.src = URL;
+						script.id = "fileLoader";
+						document.getElementsByTagName("head")[0].appendChild(script);
+					}else{
+						data = dataCache.files[URL].data;
+						resolve(data);
+					}
+				
+					
+				});
+			}
+			
+			//Register download listener.
+			function registerDownload(header, dom){
+				dom.addEventListener("click", async function(event){
+				console.log(header);
+					const fileStream = streamSaver.createWriteStream("Test.mp4", { //TODO: Add file name to header (use here)
+						size: header.totalSize
+					})
+					const writer = fileStream.getWriter();
+					
+					window.onunload = () => {
+						writableStream.abort();
+						writer.abort();
+					}
+					
+					//TODO:Offer file to download.
+					
+					for(var i=0;i<header.fileUrls.length;i++){
+						await (async function(){
+							return new Promise(async function(resolve, reject){
+								var data = await (getURLData(header.URLPrefix + header.fileUrls[i]));
+								writer.write(new Uint8Array(data.data)).then(function(){
+									resolve();
+								});
+							});
+							
+						})();
+						
+					}
+					
+					writer.close();
+					console.log("Done downloading.");
+				});
+			}
+			
+			function base64ToBuff(base64) {
+				var binary_string = window.atob(base64);
+				var len = binary_string.length;
+				var bytes = new Uint8Array(len);
+				for (var i = 0; i < len; i++) {
+					bytes[i] = binary_string.charCodeAt(i);
+				}
+				return bytes.buffer;
+			}
+		</script>
+		
+		<script>
+			document.addEventListener("DOMContentLoaded", function(event){
+				var video = document.getElementById('video');
+				var videoSrc = window.location.hash.replace("#","");
+				if (Hls.isSupported()) {
+					var header;
+					//We override network calls. Instead, we call our data collection.
+					var hls = new Hls({
+						loader: function(){
+							this.load = async function(context, config, callbacks){
+								var file = context.url.substring(context.url.lastIndexOf('/') + 1);
+								
+								var data;
+								if(file=="h0"){//Cannot use context.type
+									header = await getHeader(context.url);
+									data = await getFile(header, "prog_index.m3u8");
+									
+									registerDownload(header, document.getElementById('download'));
+								}else{
+									if("rangeEnd" in context && "rangeStart" in context){
+										data = await getFile(header, file, context.rangeStart, context.rangeEnd);
+									}else{
+										data = await getFile(header, file);
+									}
+								}
+								
+								if(context.responseType=="text"){
+									var enc = new TextDecoder("ascii");
+									data = enc.decode(new Uint8Array(data));
+								}
+								
+								callbacks.onSuccess({"url":context.url, "data": data}, {"trequest":1, "tfirst":1, "tload":1, "tloader":1, "bw":1, "total": 1}, context);
+							};
+
+							this.abort = async function(){
+								console.log("Abort request");
+							};
+
+							this.destroy = async function(){
+								console.log("Destory request");
+							};
+						}
+					});
+					
+					hls.loadSource(videoSrc);
+					hls.attachMedia(video);
+					hls.on(Hls.Events.MANIFEST_PARSED, function() {
+						video.play();
+					});
+				}
+			});
+		</script>
+	</head>
+	
+	<body>
+		<video id="video" controls width="1000"></video><br>
+		<button id="download">Download</button>
+</html>
